@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
-use editor::{Editor, EditorEvent, MultiBuffer, SelectionEffects};
+use editor::{Editor, EditorEvent, MultiBuffer, SelectionEffects, multibuffer_context_lines};
 use git::repository::{CommitDetails, CommitDiff, CommitSummary, RepoPath};
 use gpui::{
     AnyElement, AnyView, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter,
@@ -8,19 +8,18 @@ use gpui::{
 };
 use language::{
     Anchor, Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
-    Point, Rope, TextBuffer,
+    Point, ReplicaId, Rope, TextBuffer,
 };
 use multi_buffer::PathKey;
 use project::{Project, WorktreeId, git_store::Repository};
 use std::{
     any::{Any, TypeId},
-    ffi::OsStr,
     fmt::Write as _,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 use ui::{Color, Icon, IconName, Label, LabelCommon as _, SharedString};
-use util::{ResultExt, truncate_and_trailoff};
+use util::{ResultExt, paths::PathStyle, rel_path::RelPath, truncate_and_trailoff};
 use workspace::{
     Item, ItemHandle as _, ItemNavHistory, ToolbarItemLocation, Workspace,
     item::{BreadcrumbText, ItemEvent, TabContentParams},
@@ -40,12 +39,12 @@ struct GitBlob {
 }
 
 struct CommitMetadataFile {
-    title: Arc<Path>,
+    title: Arc<RelPath>,
     worktree_id: WorktreeId,
 }
 
-const COMMIT_METADATA_NAMESPACE: u32 = 0;
-const FILE_NAMESPACE: u32 = 1;
+const COMMIT_METADATA_SORT_PREFIX: u64 = 0;
+const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
 
 impl CommitView {
     pub fn open(
@@ -129,12 +128,14 @@ impl CommitView {
         let mut metadata_buffer_id = None;
         if let Some(worktree_id) = first_worktree_id {
             let file = Arc::new(CommitMetadataFile {
-                title: PathBuf::from(format!("commit {}", commit.sha)).into(),
+                title: RelPath::unix(&format!("commit {}", commit.sha))
+                    .unwrap()
+                    .into(),
                 worktree_id,
             });
             let buffer = cx.new(|cx| {
                 let buffer = TextBuffer::new_normalized(
-                    0,
+                    ReplicaId::LOCAL,
                     cx.entity_id().as_non_zero_u64().into(),
                     LineEnding::default(),
                     format_commit(&commit).into(),
@@ -144,7 +145,7 @@ impl CommitView {
             });
             multibuffer.update(cx, |multibuffer, cx| {
                 multibuffer.set_excerpts_for_path(
-                    PathKey::namespaced(COMMIT_METADATA_NAMESPACE, file.title.clone()),
+                    PathKey::with_sort_prefix(COMMIT_METADATA_SORT_PREFIX, file.title.clone()),
                     buffer.clone(),
                     vec![Point::zero()..buffer.read(cx).max_point()],
                     0,
@@ -192,10 +193,10 @@ impl CommitView {
                             .collect::<Vec<_>>();
                         let path = snapshot.file().unwrap().path().clone();
                         let _is_newly_added = multibuffer.set_excerpts_for_path(
-                            PathKey::namespaced(FILE_NAMESPACE, path),
+                            PathKey::with_sort_prefix(FILE_NAMESPACE_SORT_PREFIX, path),
                             buffer,
                             diff_hunk_ranges,
-                            editor::DEFAULT_MULTIBUFFER_CONTEXT,
+                            multibuffer_context_lines(cx),
                             cx,
                         );
                         multibuffer.add_diff(buffer_diff, cx);
@@ -227,15 +228,19 @@ impl language::File for GitBlob {
         }
     }
 
-    fn path(&self) -> &Arc<Path> {
+    fn path_style(&self, _: &App) -> PathStyle {
+        PathStyle::Posix
+    }
+
+    fn path(&self) -> &Arc<RelPath> {
         &self.path.0
     }
 
     fn full_path(&self, _: &App) -> PathBuf {
-        self.path.to_path_buf()
+        self.path.as_std_path().to_path_buf()
     }
 
-    fn file_name<'a>(&'a self, _: &'a App) -> &'a OsStr {
+    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
         self.path.file_name().unwrap()
     }
 
@@ -261,15 +266,19 @@ impl language::File for CommitMetadataFile {
         DiskState::New
     }
 
-    fn path(&self) -> &Arc<Path> {
+    fn path_style(&self, _: &App) -> PathStyle {
+        PathStyle::Posix
+    }
+
+    fn path(&self) -> &Arc<RelPath> {
         &self.title
     }
 
     fn full_path(&self, _: &App) -> PathBuf {
-        self.title.as_ref().into()
+        PathBuf::from(self.title.as_unix_str().to_owned())
     }
 
-    fn file_name<'a>(&'a self, _: &'a App) -> &'a OsStr {
+    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
         self.title.file_name().unwrap()
     }
 
@@ -307,7 +316,7 @@ async fn build_buffer(
     };
     let buffer = cx.new(|cx| {
         let buffer = TextBuffer::new_normalized(
-            0,
+            ReplicaId::LOCAL,
             cx.entity_id().as_non_zero_u64().into(),
             line_ending,
             text,
@@ -443,10 +452,6 @@ impl Item for CommitView {
             .update(cx, |editor, cx| editor.deactivated(window, cx));
     }
 
-    fn is_singleton(&self, _: &App) -> bool {
-        false
-    }
-
     fn act_as_type<'a>(
         &'a self,
         type_id: TypeId,
@@ -512,6 +517,29 @@ impl Item for CommitView {
         self.editor.update(cx, |editor, cx| {
             editor.added_to_workspace(workspace, window, cx)
         });
+    }
+
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<workspace::WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Self>>
+    where
+        Self: Sized,
+    {
+        Some(cx.new(|cx| {
+            let editor = cx.new(|cx| {
+                self.editor
+                    .update(cx, |editor, cx| editor.clone(window, cx))
+            });
+            let multibuffer = editor.read(cx).buffer().clone();
+            Self {
+                editor,
+                multibuffer,
+                commit: self.commit.clone(),
+            }
+        }))
     }
 }
 

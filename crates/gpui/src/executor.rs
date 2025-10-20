@@ -210,7 +210,8 @@ impl BackgroundExecutor {
         }
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
 
-        let unparker = self.dispatcher.unparker();
+        let parker = parking::Parker::new();
+        let unparker = parker.unparker();
         let waker = waker_fn(move || {
             unparker.unpark();
         });
@@ -222,10 +223,14 @@ impl BackgroundExecutor {
                 Poll::Pending => {
                     let timeout =
                         deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-                    if !self.dispatcher.park(timeout)
-                        && deadline.is_some_and(|deadline| deadline < Instant::now())
-                    {
-                        return Err(future);
+                    if let Some(timeout) = timeout {
+                        if !parker.park_timeout(timeout)
+                            && deadline.is_some_and(|deadline| deadline < Instant::now())
+                        {
+                            return Err(future);
+                        }
+                    } else {
+                        parker.park();
                     }
                 }
             }
@@ -242,6 +247,8 @@ impl BackgroundExecutor {
     ) -> Result<Fut::Output, impl Future<Output = Fut::Output> + use<Fut>> {
         use std::sync::atomic::AtomicBool;
 
+        use parking::Parker;
+
         let mut future = Box::pin(future);
         if timeout == Some(Duration::ZERO) {
             return Err(future);
@@ -255,10 +262,14 @@ impl BackgroundExecutor {
         } else {
             usize::MAX
         };
-        let unparker = self.dispatcher.unparker();
+
+        let parker = Parker::new();
+        let unparker = parker.unparker();
+
         let awoken = Arc::new(AtomicBool::new(false));
         let waker = waker_fn({
             let awoken = awoken.clone();
+            let unparker = unparker.clone();
             move || {
                 awoken.store(true, SeqCst);
                 unparker.unpark();
@@ -297,7 +308,8 @@ impl BackgroundExecutor {
                                 "parked with nothing left to run{waiting_message}{backtrace_message}",
                             )
                         }
-                        self.dispatcher.park(None);
+                        dispatcher.set_unparker(unparker.clone());
+                        parker.park();
                     }
                 }
             }
@@ -391,7 +403,7 @@ impl BackgroundExecutor {
     }
 
     /// in tests, run all tasks that are ready to run. If after doing so
-    /// the test still has outstanding tasks, this will panic. (See also `allow_parking`)
+    /// the test still has outstanding tasks, this will panic. (See also [`Self::allow_parking`])
     #[cfg(any(test, feature = "test-support"))]
     pub fn run_until_parked(&self) {
         self.dispatcher.as_test().unwrap().run_until_parked()
@@ -405,7 +417,7 @@ impl BackgroundExecutor {
         self.dispatcher.as_test().unwrap().allow_parking();
     }
 
-    /// undoes the effect of [`allow_parking`].
+    /// undoes the effect of [`Self::allow_parking`].
     #[cfg(any(test, feature = "test-support"))]
     pub fn forbid_parking(&self) {
         self.dispatcher.as_test().unwrap().forbid_parking();
@@ -480,7 +492,7 @@ impl ForegroundExecutor {
 /// Variant of `async_task::spawn_local` that includes the source location of the spawn in panics.
 ///
 /// Copy-modified from:
-/// https://github.com/smol-rs/async-task/blob/ca9dbe1db9c422fd765847fa91306e30a6bb58a9/src/runnable.rs#L405
+/// <https://github.com/smol-rs/async-task/blob/ca9dbe1db9c422fd765847fa91306e30a6bb58a9/src/runnable.rs#L405>
 #[track_caller]
 fn spawn_local_with_source_location<Fut, S>(
     future: Fut,
@@ -513,9 +525,7 @@ where
                 "local task dropped by a thread that didn't spawn it. Task spawned at {}",
                 self.location
             );
-            unsafe {
-                ManuallyDrop::drop(&mut self.inner);
-            }
+            unsafe { ManuallyDrop::drop(&mut self.inner) };
         }
     }
 

@@ -4,7 +4,6 @@ use gpui::{
 };
 use itertools::Itertools;
 use serde_json::json;
-use settings::get_key_equivalents;
 use ui::{Button, ButtonStyle};
 use ui::{
     ButtonCommon, Clickable, Context, FluentBuilder, InteractiveElement, Label, LabelCommon,
@@ -169,7 +168,8 @@ impl Item for KeyContextView {
 impl Render for KeyContextView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
         use itertools::Itertools;
-        let key_equivalents = get_key_equivalents(cx.keyboard_layout().id());
+
+        let key_equivalents = cx.keyboard_mapper().get_key_equivalents();
         v_flex()
             .id("key-context-view")
             .overflow_scroll()
@@ -207,7 +207,7 @@ impl Render for KeyContextView {
                             .on_click(|_, _, cx| cx.open_url("https://zed.dev/docs/key-bindings")),
                     )
                     .child(
-                        Button::new("view_default_keymap", "View default keymap")
+                        Button::new("view_default_keymap", "View Default Keymap")
                             .style(ButtonStyle::Filled)
                             .key_binding(ui::KeyBinding::for_action(
                                 &zed_actions::OpenDefaultKeymap,
@@ -219,11 +219,11 @@ impl Render for KeyContextView {
                             }),
                     )
                     .child(
-                        Button::new("edit_your_keymap", "Edit your keymap")
+                        Button::new("edit_your_keymap", "Edit Keymap File")
                             .style(ButtonStyle::Filled)
-                            .key_binding(ui::KeyBinding::for_action(&zed_actions::OpenKeymap, window, cx))
+                            .key_binding(ui::KeyBinding::for_action(&zed_actions::OpenKeymapFile, window, cx))
                             .on_click(|_, window, cx| {
-                                window.dispatch_action(zed_actions::OpenKeymap.boxed_clone(), cx);
+                                window.dispatch_action(zed_actions::OpenKeymapFile.boxed_clone(), cx);
                             }),
                     ),
             )

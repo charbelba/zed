@@ -118,7 +118,7 @@ fn render_color_ribbon(color: Hsla) -> impl Element {
         move |bounds, _, window, _| {
             let height = bounds.size.height;
             let horizontal_offset = height;
-            let vertical_offset = px(height.0 / 2.0);
+            let vertical_offset = height / 2.0;
             let mut path = Path::new(bounds.bottom_left());
             path.curve_to(
                 bounds.origin + point(horizontal_offset, vertical_offset),
@@ -337,7 +337,7 @@ impl TitleBar {
 
         let room = room.read(cx);
         let project = self.project.read(cx);
-        let is_local = project.is_local() || project.is_via_ssh();
+        let is_local = project.is_local() || project.is_via_remote_server();
         let is_shared = is_local && project.is_shared();
         let is_muted = room.is_muted();
         let muted_by_user = room.muted_by_user();

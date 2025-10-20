@@ -85,7 +85,7 @@ struct PendingHunk {
     new_status: DiffHunkSecondaryStatus,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct DiffHunkSummary {
     buffer_range: Range<Anchor>,
 }
@@ -111,18 +111,20 @@ impl sum_tree::Item for PendingHunk {
 }
 
 impl sum_tree::Summary for DiffHunkSummary {
-    type Context = text::BufferSnapshot;
+    type Context<'a> = &'a text::BufferSnapshot;
 
-    fn zero(_cx: &Self::Context) -> Self {
-        Default::default()
+    fn zero(_cx: Self::Context<'_>) -> Self {
+        DiffHunkSummary {
+            buffer_range: Anchor::MIN..Anchor::MIN,
+        }
     }
 
-    fn add_summary(&mut self, other: &Self, buffer: &Self::Context) {
-        self.buffer_range.start = self
+    fn add_summary(&mut self, other: &Self, buffer: Self::Context<'_>) {
+        self.buffer_range.start = *self
             .buffer_range
             .start
             .min(&other.buffer_range.start, buffer);
-        self.buffer_range.end = self.buffer_range.end.max(&other.buffer_range.end, buffer);
+        self.buffer_range.end = *self.buffer_range.end.max(&other.buffer_range.end, buffer);
     }
 }
 
@@ -154,6 +156,22 @@ impl BufferDiffSnapshot {
         BufferDiffSnapshot {
             inner: BufferDiffInner {
                 base_text: language::Buffer::build_empty_snapshot(cx),
+                hunks: SumTree::new(buffer),
+                pending_hunks: SumTree::new(buffer),
+                base_text_exists: false,
+            },
+            secondary_diff: None,
+        }
+    }
+
+    fn unchanged(
+        buffer: &text::BufferSnapshot,
+        base_text: language::BufferSnapshot,
+    ) -> BufferDiffSnapshot {
+        debug_assert_eq!(buffer.text(), base_text.text());
+        BufferDiffSnapshot {
+            inner: BufferDiffInner {
+                base_text,
                 hunks: SumTree::new(buffer),
                 pending_hunks: SumTree::new(buffer),
                 base_text_exists: false,
@@ -213,7 +231,10 @@ impl BufferDiffSnapshot {
         cx: &App,
     ) -> impl Future<Output = Self> + use<> {
         let base_text_exists = base_text.is_some();
-        let base_text_pair = base_text.map(|text| (text, base_text_snapshot.as_rope().clone()));
+        let base_text_pair = base_text.map(|text| {
+            debug_assert_eq!(&*text, &base_text_snapshot.text());
+            (text, base_text_snapshot.as_rope().clone())
+        });
         cx.background_executor()
             .spawn_labeled(*CALCULATE_DIFF_TASK, async move {
                 Self {
@@ -873,6 +894,18 @@ impl BufferDiff {
         }
     }
 
+    pub fn new_unchanged(
+        buffer: &text::BufferSnapshot,
+        base_text: language::BufferSnapshot,
+    ) -> Self {
+        debug_assert_eq!(buffer.text(), base_text.text());
+        BufferDiff {
+            buffer_id: buffer.remote_id(),
+            inner: BufferDiffSnapshot::unchanged(buffer, base_text).inner,
+            secondary_diff: None,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_base_text(
         base_text: &str,
@@ -906,7 +939,9 @@ impl BufferDiff {
 
     pub fn clear_pending_hunks(&mut self, cx: &mut Context<Self>) {
         if self.secondary_diff.is_some() {
-            self.inner.pending_hunks = SumTree::from_summary(DiffHunkSummary::default());
+            self.inner.pending_hunks = SumTree::from_summary(DiffHunkSummary {
+                buffer_range: Anchor::MIN..Anchor::MIN,
+            });
             cx.emit(BufferDiffEvent::DiffChanged {
                 changed_range: Some(Anchor::MIN..Anchor::MAX),
             });
@@ -1037,8 +1072,8 @@ impl BufferDiff {
                 self.range_to_hunk_range(secondary_changed_range, buffer, cx)
         {
             if let Some(range) = &mut changed_range {
-                range.start = secondary_hunk_range.start.min(&range.start, buffer);
-                range.end = secondary_hunk_range.end.max(&range.end, buffer);
+                range.start = *secondary_hunk_range.start.min(&range.start, buffer);
+                range.end = *secondary_hunk_range.end.max(&range.end, buffer);
             } else {
                 changed_range = Some(secondary_hunk_range);
             }
@@ -1052,8 +1087,8 @@ impl BufferDiff {
             if let Some((first, last)) = state.pending_hunks.first().zip(state.pending_hunks.last())
             {
                 if let Some(range) = &mut changed_range {
-                    range.start = range.start.min(&first.buffer_range.start, buffer);
-                    range.end = range.end.max(&last.buffer_range.end, buffer);
+                    range.start = *range.start.min(&first.buffer_range.start, buffer);
+                    range.end = *range.end.max(&last.buffer_range.end, buffer);
                 } else {
                     changed_range = Some(first.buffer_range.start..last.buffer_range.end);
                 }
@@ -1337,7 +1372,7 @@ mod tests {
     use gpui::TestAppContext;
     use pretty_assertions::{assert_eq, assert_ne};
     use rand::{Rng as _, rngs::StdRng};
-    use text::{Buffer, BufferId, Rope};
+    use text::{Buffer, BufferId, ReplicaId, Rope};
     use unindent::Unindent as _;
     use util::test::marked_text_ranges;
 
@@ -1362,7 +1397,7 @@ mod tests {
         "
         .unindent();
 
-        let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), buffer_text);
+        let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), buffer_text);
         let mut diff = BufferDiffSnapshot::new_sync(buffer.clone(), diff_base.clone(), cx);
         assert_hunks(
             diff.hunks_intersecting_range(Anchor::MIN..Anchor::MAX, &buffer),
@@ -1436,7 +1471,7 @@ mod tests {
         "
         .unindent();
 
-        let buffer = Buffer::new(0, BufferId::new(1).unwrap(), buffer_text);
+        let buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), buffer_text);
         let unstaged_diff = BufferDiffSnapshot::new_sync(buffer.clone(), index_text, cx);
         let mut uncommitted_diff =
             BufferDiffSnapshot::new_sync(buffer.clone(), head_text.clone(), cx);
@@ -1505,7 +1540,7 @@ mod tests {
         "
         .unindent();
 
-        let buffer = Buffer::new(0, BufferId::new(1).unwrap(), buffer_text);
+        let buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), buffer_text);
         let diff = cx
             .update(|cx| {
                 BufferDiffSnapshot::new_with_base_text(
@@ -1768,7 +1803,7 @@ mod tests {
 
         for example in table {
             let (buffer_text, ranges) = marked_text_ranges(&example.buffer_marked_text, false);
-            let buffer = Buffer::new(0, BufferId::new(1).unwrap(), buffer_text);
+            let buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), buffer_text);
             let hunk_range =
                 buffer.anchor_before(ranges[0].start)..buffer.anchor_before(ranges[0].end);
 
@@ -1841,7 +1876,11 @@ mod tests {
         "
         .unindent();
 
-        let buffer = Buffer::new(0, BufferId::new(1).unwrap(), buffer_text.clone());
+        let buffer = Buffer::new(
+            ReplicaId::LOCAL,
+            BufferId::new(1).unwrap(),
+            buffer_text.clone(),
+        );
         let unstaged = BufferDiffSnapshot::new_sync(buffer.clone(), index_text, cx);
         let uncommitted = BufferDiffSnapshot::new_sync(buffer.clone(), head_text.clone(), cx);
         let unstaged_diff = cx.new(|cx| {
@@ -1914,7 +1953,7 @@ mod tests {
         "
         .unindent();
 
-        let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), buffer_text_1);
+        let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), buffer_text_1);
 
         let empty_diff = cx.update(|cx| BufferDiffSnapshot::empty(&buffer, cx));
         let diff_1 = BufferDiffSnapshot::new_sync(buffer.clone(), base_text.clone(), cx);
@@ -2013,10 +2052,10 @@ mod tests {
     #[gpui::test(iterations = 100)]
     async fn test_staging_and_unstaging_hunks(cx: &mut TestAppContext, mut rng: StdRng) {
         fn gen_line(rng: &mut StdRng) -> String {
-            if rng.gen_bool(0.2) {
+            if rng.random_bool(0.2) {
                 "\n".to_owned()
             } else {
-                let c = rng.gen_range('A'..='Z');
+                let c = rng.random_range('A'..='Z');
                 format!("{c}{c}{c}\n")
             }
         }
@@ -2024,8 +2063,8 @@ mod tests {
         fn gen_working_copy(rng: &mut StdRng, head: &str) -> String {
             let mut old_lines = {
                 let mut old_lines = Vec::new();
-                let mut old_lines_iter = head.lines();
-                while let Some(line) = old_lines_iter.next() {
+                let old_lines_iter = head.lines();
+                for line in old_lines_iter {
                     assert!(!line.ends_with("\n"));
                     old_lines.push(line.to_owned());
                 }
@@ -2035,7 +2074,7 @@ mod tests {
                 old_lines.into_iter()
             };
             let mut result = String::new();
-            let unchanged_count = rng.gen_range(0..=old_lines.len());
+            let unchanged_count = rng.random_range(0..=old_lines.len());
             result +=
                 &old_lines
                     .by_ref()
@@ -2045,14 +2084,14 @@ mod tests {
                         s
                     });
             while old_lines.len() > 0 {
-                let deleted_count = rng.gen_range(0..=old_lines.len());
+                let deleted_count = rng.random_range(0..=old_lines.len());
                 let _advance = old_lines
                     .by_ref()
                     .take(deleted_count)
                     .map(|line| line.len() + 1)
                     .sum::<usize>();
                 let minimum_added = if deleted_count == 0 { 1 } else { 0 };
-                let added_count = rng.gen_range(minimum_added..=5);
+                let added_count = rng.random_range(minimum_added..=5);
                 let addition = (0..added_count).map(|_| gen_line(rng)).collect::<String>();
                 result += &addition;
 
@@ -2061,7 +2100,8 @@ mod tests {
                     if blank_lines == old_lines.len() {
                         break;
                     };
-                    let unchanged_count = rng.gen_range((blank_lines + 1).max(1)..=old_lines.len());
+                    let unchanged_count =
+                        rng.random_range((blank_lines + 1).max(1)..=old_lines.len());
                     result += &old_lines.by_ref().take(unchanged_count).fold(
                         String::new(),
                         |mut s, line| {
@@ -2118,7 +2158,7 @@ mod tests {
             )
         });
         let working_copy = working_copy.read_with(cx, |working_copy, _| working_copy.snapshot());
-        let mut index_text = if rng.r#gen() {
+        let mut index_text = if rng.random() {
             Rope::from(head_text.as_str())
         } else {
             working_copy.as_rope().clone()
@@ -2134,7 +2174,7 @@ mod tests {
         }
 
         for _ in 0..operations {
-            let i = rng.gen_range(0..hunks.len());
+            let i = rng.random_range(0..hunks.len());
             let hunk = &mut hunks[i];
             let hunk_to_change = hunk.clone();
             let stage = match hunk.secondary_status {

@@ -1,5 +1,5 @@
 use crate::markdown_elements::{
-    HeadingLevel, Link, MarkdownParagraph, MarkdownParagraphChunk, ParsedLatexMath, ParsedMarkdown, ParsedMarkdownBlockQuote, ParsedMarkdownCodeBlock, ParsedMarkdownElement, ParsedMarkdownHeading, ParsedMarkdownListItem, ParsedMarkdownListItemType, ParsedMarkdownMermaid, ParsedMarkdownTable, ParsedMarkdownTableAlignment, ParsedMarkdownTableRow
+    Image, HeadingLevel, Link, MarkdownParagraph, MarkdownParagraphChunk, ParsedLatexMath, ParsedMarkdown, ParsedMarkdownBlockQuote, ParsedMarkdownCodeBlock, ParsedMarkdownElement, ParsedMarkdownHeading, ParsedMarkdownListItem, ParsedMarkdownListItemType, ParsedMarkdownMermaid, ParsedMarkdownTable, ParsedMarkdownTableAlignment, ParsedMarkdownTableRow
 };
 use gpui::{
     div, img, rems, svg, AbsoluteLength, AnyElement, App, AppContext as _, ClipboardItem, Context, DefiniteLength, Div, Element, ElementId, Entity, HighlightStyle, Hsla, Image, ImageSource, InteractiveText, IntoElement, Keystroke, Length, Modifiers, ParentElement, Render, Resource, SharedString, Styled, StyledText, TextStyle, WeakEntity, Window
