@@ -26,7 +26,7 @@ use rpc::{
 use smol::channel::Receiver;
 use std::{io, pin::pin, sync::Arc, time::Instant};
 use text::{BufferId, ReplicaId};
-use util::{ResultExt as _, TryFutureExt, debug_panic, maybe, rel_path::RelPath};
+use util::{ResultExt as _, TryFutureExt, debug_panic, maybe, paths::PathStyle, rel_path::RelPath};
 use worktree::{File, PathChange, ProjectEntryId, Worktree, WorktreeId};
 
 /// A set of open buffers.
@@ -623,8 +623,11 @@ impl LocalBufferStore {
             let load_file = worktree.load_file(path.as_ref(), cx);
             let reservation = cx.reserve_entity();
             let buffer_id = BufferId::from(reservation.entity_id().as_non_zero_u64());
+            let path = path.clone();
             cx.spawn(async move |_, cx| {
-                let loaded = load_file.await?;
+                let loaded = load_file.await.with_context(|| {
+                    format!("Could not open path: {}", path.display(PathStyle::local()))
+                })?;
                 let text_buffer = cx
                     .background_spawn(async move {
                         text::Buffer::new(ReplicaId::LOCAL, buffer_id, loaded.text)
@@ -906,7 +909,14 @@ impl BufferStore {
         };
         cx.spawn(async move |this, cx| {
             task.await?;
-            this.update(cx, |_, cx| {
+            this.update(cx, |this, cx| {
+                old_file.clone().and_then(|file| {
+                    this.path_to_buffer_id.remove(&ProjectPath {
+                        worktree_id: file.worktree_id(cx),
+                        path: file.path().clone(),
+                    })
+                });
+
                 cx.emit(BufferStoreEvent::BufferChangedFilePath { buffer, old_file });
             })
         })
