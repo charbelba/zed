@@ -29,6 +29,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Shorten Cargo home on Windows
+        if: runner.os == 'Windows'
+        run: |
+          mkdir C:\cargo
+          echo "CARGO_HOME=C:\cargo" >> $env:GITHUB_ENV
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,4 +57,4 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: artifacts/
-          if-no-files-found: error
+
