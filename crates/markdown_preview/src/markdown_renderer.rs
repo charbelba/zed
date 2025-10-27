@@ -1,4 +1,5 @@
 use crate::markdown_elements::{
+    ParsedLatexMath, ParsedMarkdownMermaid,
     HeadingLevel, Image, Link, MarkdownParagraph, MarkdownParagraphChunk, ParsedMarkdown,
     ParsedMarkdownBlockQuote, ParsedMarkdownCodeBlock, ParsedMarkdownElement,
     ParsedMarkdownHeading, ParsedMarkdownListItem, ParsedMarkdownListItemType, ParsedMarkdownTable,
@@ -12,13 +13,8 @@ use gpui::{
     WeakEntity, Window, div, img, rems,
 };
 use settings::Settings;
-use std::env;
-use std::path::Path;
-use std::process::Command;
 use std::{
-    fs::File,
     ops::{Mul, Range},
-    path::PathBuf,
     sync::Arc,
     vec,
 };
@@ -30,6 +26,7 @@ use ui::{
     h_flex, tooltip_container, v_flex,
 };
 use workspace::{OpenOptions, OpenVisible, Workspace};
+
 pub struct CheckboxClickedEvent {
     pub checked: bool,
     pub source_range: Range<usize>,
@@ -58,6 +55,7 @@ pub struct RenderContext {
     title_bar_background_color: Hsla,
     panel_background_color: Hsla,
     text_color: Hsla,
+    link_color: Hsla,
     window_rem_size: Pixels,
     text_muted_color: Hsla,
     code_block_background_color: Hsla,
@@ -65,6 +63,7 @@ pub struct RenderContext {
     syntax_theme: Arc<SyntaxTheme>,
     indent: usize,
     checkbox_clicked_callback: Option<CheckboxClickedCallback>,
+    is_last_child: bool,
 }
 
 impl RenderContext {
@@ -93,11 +92,13 @@ impl RenderContext {
             title_bar_background_color: theme.colors().title_bar_background,
             panel_background_color: theme.colors().panel_background,
             text_color: theme.colors().text,
+            link_color: theme.colors().text_accent,
             window_rem_size: window.rem_size(),
             text_muted_color: theme.colors().text_muted,
             code_block_background_color: theme.colors().surface_background,
             code_span_background_color: theme.colors().editor_document_highlight_read_background,
             checkbox_clicked_callback: None,
+            is_last_child: false,
         }
     }
 
@@ -139,11 +140,24 @@ impl RenderContext {
     /// We give padding between "This is a block quote."
     /// and "And this is the next paragraph."
     fn with_common_p(&self, element: Div) -> Div {
-        if self.indent > 0 {
+        if self.indent > 0 && !self.is_last_child {
             element.pb(self.scaled_rems(0.75))
         } else {
             element
         }
+    }
+
+    /// The is used to indicate that the current element is the last child or not of its parent.
+    ///
+    /// Then we can avoid adding padding to the bottom of the last child.
+    fn with_last_child<R>(&mut self, is_last: bool, render: R) -> AnyElement
+    where
+        R: FnOnce(&mut Self) -> AnyElement,
+    {
+        self.is_last_child = is_last;
+        let element = render(self);
+        self.is_last_child = false;
+        element
     }
 }
 
@@ -164,7 +178,6 @@ pub fn render_parsed_markdown(
 }
 pub fn render_markdown_block(block: &ParsedMarkdownElement, cx: &mut RenderContext) -> AnyElement {
     use ParsedMarkdownElement::*;
-    print!("rendering block: {:?}", block);
     match block {
         Paragraph(text) => render_markdown_paragraph(text, cx),
         Heading(heading) => render_markdown_heading(heading, cx),
@@ -173,370 +186,10 @@ pub fn render_markdown_block(block: &ParsedMarkdownElement, cx: &mut RenderConte
         BlockQuote(block_quote) => render_markdown_block_quote(block_quote, cx),
         CodeBlock(code_block) => render_markdown_code_block(code_block, cx),
         HorizontalRule(_) => render_markdown_rule(cx),
+        Image(image) => render_markdown_image(image, cx),
         Mermaid(mermaid) => render_markdown_mermaid(mermaid, cx),
         DisplayMath(latex) => render_markdown_latex(latex, cx),
-        Image(image) => render_markdown_image(image, cx),
     }
-}
-
-fn render_markdown_image(image: &Image, cx: &mut RenderContext) -> AnyElement {
-    let image_resource = match image.link.clone() {
-        Link::Web { url } => Resource::Uri(url.into()),
-        Link::Path { path, .. } => Resource::Path(Arc::from(path)),
-    };
-
-    let element_id = cx.next_id(&image.source_range);
-    let workspace = cx.workspace.clone();
-
-    div()
-        .id(element_id)
-        .cursor_pointer()
-        .child(
-            img(ImageSource::Resource(image_resource))
-                .max_w_full()
-                .with_fallback({
-                    let alt_text = image.alt_text.clone();
-                    move || div().children(alt_text.clone()).into_any_element()
-                })
-                .when_some(image.height, |this, height| this.h(height))
-                .when_some(image.width, |this, width| this.w(width)),
-        )
-        .tooltip({
-            let link = image.link.clone();
-            let alt_text = image.alt_text.clone();
-            move |_, cx| {
-                InteractiveMarkdownElementTooltip::new(
-                    Some(alt_text.clone().unwrap_or(link.to_string().into())),
-                    "open image",
-                    cx,
-                )
-                .into()
-            }
-        })
-        .on_click({
-            let link = image.link.clone();
-            move |_, window, cx| {
-                if window.modifiers().secondary() {
-                    match &link {
-                        Link::Web { url } => cx.open_url(url),
-                        Link::Path { path, .. } => {
-                            if let Some(workspace) = &workspace {
-                                _ = workspace.update(cx, |workspace, cx| {
-                                    workspace
-                                        .open_abs_path(
-                                            path.clone(),
-                                            OpenOptions {
-                                                visible: Some(OpenVisible::None),
-                                                ..Default::default()
-                                            },
-                                            window,
-                                            cx,
-                                        )
-                                        .detach();
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .into_any()
-}
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
-use std::collections::HashSet;
-use std::sync::Mutex;
-use std::thread;
-lazy_static::lazy_static! {
-    static ref GENERATING_LATEX: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
-    static ref GENERATING: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
-}
-
-fn generate_mermaid_svg_async(mermaid_code: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    mermaid_code.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let tmp_dir = env::temp_dir();
-    let tmp_png = tmp_dir.join(format!("diagram_{}.png", hash));
-    let tmp_mmd = tmp_dir.join(format!("diagram_{}.mmd", hash));
-
-    println!("tmp dir: {:?}", tmp_dir);
-
-    if tmp_png.exists() {
-        return tmp_png;
-    }
-
-    if !tmp_mmd.exists() {
-        std::fs::write(&tmp_mmd, mermaid_code).expect("Failed to write Mermaid file");
-    }
-
-    let mut generating = GENERATING.lock().unwrap();
-    if !generating.contains(&hash) {
-        generating.insert(hash);
-        let png_clone = tmp_png.clone();
-        let mmd_clone = tmp_mmd.clone();
-        thread::spawn(move || {
-            if !png_clone.exists() {
-                let _ = Command::new(r"C:\nvm4w\nodejs\mmdc.cmd")
-                    .args(&[
-                        "-i",
-                        mmd_clone.to_str().unwrap(),
-                        "-o",
-                        png_clone.to_str().unwrap(),
-                        "-w",
-                        "600",
-                        "-H",
-                        "400",
-                    ])
-                    .status();
-            }
-            GENERATING.lock().unwrap().remove(&hash);
-        });
-    }
-
-    tmp_png
-}
-
-fn render_markdown_mermaid(mermaid: &ParsedMarkdownMermaid, cx: &mut RenderContext) -> AnyElement {
-    // let url = String::from("file:///C:/Users/Charbel/Downloads/Untitled%20diagram%20_%20Mermaid%20Chart-2025-08-19-011545.svg");
-    //                let image_resource = Resource::Uri(url.into());0
-
-    let svg_path = generate_mermaid_svg_async(&mermaid.contents);
-    println!("svg path: {:?}", svg_path);
-
-    //  let svg_path = "tmp\test.png";
-    let image_resource = Resource::Path(Arc::from(Path::new(&svg_path)));
-
-    let element_id = cx.next_id(&mermaid.source_range);
-
-    let image_element = div()
-        .id(element_id)
-        .cursor_pointer()
-        .child(img(ImageSource::Resource(image_resource)).max_w_full())
-        .into_any();
-
-    // let svg_path = "C:\\Users\\Charbel\\OneDrive\\Desktop\\zed\\tmp\\equation.svg";
-    // let test_svg = PathBuf::from(&svg_path);
-
-    // let image_svg = div()
-    //     .id(element_id)
-    //     .cursor_pointer()
-    //     .child( img(ImageSource::from(test_svg.clone()))
-    //     .max_w_full()
-    //     .max_h_full()
-    //     .with_fallback(|| {
-    //         div()
-    //             .p_4()
-    //             .child("Failed to load SVG file")
-    //             .into_any_element()
-    //     })
-    //     )
-    //     .into_any_element();
-    //     return image_svg;
-    // }
-    image_element
-}
-
-use mathjax::MathJax;
-use resvg::render;
-use resvg::tiny_skia::{Pixmap, Transform};
-use resvg::usvg::{Options, Tree, TreeParsing};
-use std::io::Write;
-
-fn generate_latex_mathjax_svg_async(latex_code: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    latex_code.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let tmp_dir = env::temp_dir();
-    let svg_file = tmp_dir.join(format!("latex_{}.svg", hash));
-
-    if svg_file.exists() {
-        return svg_file;
-    }
-
-    let mut generating = GENERATING_LATEX.lock().unwrap();
-    if !generating.contains(&hash) {
-        generating.insert(hash);
-        let code = latex_code.to_string();
-        let svg_clone = svg_file.clone();
-
-        thread::spawn(move || {
-            let renderer = MathJax::new().expect("Failed to initialize MathJax");
-            let mut result = renderer.render(&code).expect("Failed to render LaTeX");
-            result.set_color("white");
-
-            let write_path = svg_clone.clone();
-            std::fs::write(write_path, result.into_raw()).unwrap();
-
-            println!("SVG generated: {:?}", svg_clone);
-            GENERATING_LATEX.lock().unwrap().remove(&hash);
-        });
-    }
-
-    svg_file
-}
-
-fn generate_latex_mathjax_svg(latex_code: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    latex_code.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let tmp_dir = env::temp_dir();
-    let svg_file = tmp_dir.join(format!("latex_{}.svg", hash));
-
-    if svg_file.exists() {
-        return svg_file;
-    }
-
-    let renderer = MathJax::new().expect("Failed to initialize MathJax");
-    let mut result = renderer.render(latex_code).expect("Failed to render LaTeX");
-    result.set_color("white");
-
-    std::fs::write(&svg_file, result.into_raw()).unwrap();
-    svg_file
-}
-
-fn generate_latex_mathjax_png_async(latex_code: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    latex_code.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let tmp_dir = env::temp_dir();
-    let png_file = tmp_dir.join(format!("latex_{}.png", hash));
-
-    if png_file.exists() {
-        return png_file;
-    }
-
-    let mut generating = GENERATING_LATEX.lock().unwrap();
-    if !generating.contains(&hash) {
-        generating.insert(hash);
-        let code = latex_code.to_string();
-        let png_clone = png_file.clone();
-
-        thread::spawn(move || {
-            let renderer = MathJax::new().expect("Failed to initialize MathJax");
-
-            let mut result = renderer.render(&code).expect("Failed to render LaTeX");
-            result.set_color("white");
-            let image = result.into_image(1.4).expect("Failed to convert to image");
-
-            image.save(&png_clone).expect("Failed to save PNG file");
-
-            println!("PNG generated: {:?}", png_clone);
-            GENERATING_LATEX.lock().unwrap().remove(&hash);
-        });
-    }
-
-    png_file
-}
-
-fn generate_latex_png_async(latex_code: &str) -> PathBuf {
-    // Hash LaTeX code
-    let mut hasher = DefaultHasher::new();
-    latex_code.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let tmp_dir = env::temp_dir();
-    let png_file = tmp_dir.join(format!("latex_{}.png", hash));
-
-    if png_file.exists() {
-        return png_file;
-    }
-
-    let mut generating = GENERATING_LATEX.lock().unwrap();
-    if !generating.contains(&hash) {
-        generating.insert(hash);
-        let code = latex_code.to_string();
-        let png_clone = png_file.clone();
-
-        thread::spawn(move || {
-            // Step 1: Render LaTeX → SVG using KaTeX (Node.js)
-            let svg_content = {
-                let output = std::process::Command::new("node")
-                    .arg("-e")
-                    .arg(format!(
-                        r#"
-            const katex = require('katex');
-            const svg = katex.renderToString(`{}`, {{ throwOnError: false, output: 'svg' }});
-            console.log(svg);
-        "#,
-                        code.replace('`', "\\`")
-                    ))
-                    .output()
-                    .expect("Failed to run Node.js KaTeX");
-
-                let svg = String::from_utf8_lossy(&output.stdout).to_string();
-                println!("SVG OUTPUT: {}", svg); // << check this!
-                svg
-            };
-            println!("SVG Content: {}", svg_content);
-
-            // Step 2: Convert SVG → PNG using resvg + tiny-skia
-            let options = Options::default();
-            let tree = Tree::from_str(&svg_content, &options).expect("Failed to parse SVG");
-            let size = tree.size.to_screen_size();
-            let mut pixmap =
-                Pixmap::new(size.width(), size.height()).expect("Failed to create pixmap");
-
-            // Render with default transform
-            render(
-                &tree,
-                resvg::FitTo::Original,
-                Transform::default(),
-                pixmap.as_mut(),
-            )
-            .expect("Failed to render SVG to PNG");
-
-            // Write PNG to file
-            let mut file = File::create(&png_clone).expect("Failed to create PNG file");
-            let png_data = pixmap.encode_png().expect("Failed to encode PNG");
-            file.write_all(&png_data).expect("Failed to write PNG file");
-
-            println!("PNG generated: {:?}", png_clone);
-            GENERATING_LATEX.lock().unwrap().remove(&hash);
-        });
-    }
-
-    png_file
-}
-
-fn render_markdown_latex(latex: &ParsedLatexMath, cx: &mut RenderContext) -> AnyElement {
-    let svg_path = generate_latex_mathjax_png_async(&latex.contents);
-    let image_resource = Resource::Path(Arc::from(Path::new(&svg_path)));
-    let element_id = cx.next_id(&latex.source_range);
-
-    div()
-        .id(element_id)
-        .border_5()
-        .cursor_pointer()
-        .children(vec![
-            img(ImageSource::Resource(image_resource))
-                .max_w_full()
-                .with_loading(|| div().p_4().child("Loading 2").into_any_element()),
-        ])
-        .into_any()
-
-    // h_flex()
-    // .gap_10()
-    // .border_10()
-    // .id(element_id)
-    // .cursor_pointer()
-    // .children(vec![
-    //     img(ImageSource::Resource(image_resource))
-    //         .max_w_full()
-    //         .with_loading(|| {
-    //             div()
-    //                 .p_4()
-    //                 .child("Loading 2")
-    //                 .into_any_element()
-    //         }),
-    // ])
-    // .into_any()
 }
 
 fn render_markdown_heading(parsed: &ParsedMarkdownHeading, cx: &mut RenderContext) -> AnyElement {
@@ -930,7 +583,12 @@ fn render_markdown_block_quote(
     let children: Vec<AnyElement> = parsed
         .children
         .iter()
-        .map(|child| render_markdown_block(child, cx))
+        .enumerate()
+        .map(|(ix, child)| {
+            cx.with_last_child(ix + 1 == parsed.children.len(), |cx| {
+                render_markdown_block(child, cx)
+            })
+        })
         .collect();
 
     cx.indent -= 1;
@@ -995,25 +653,23 @@ fn render_markdown_code_block(
 fn render_markdown_paragraph(parsed: &MarkdownParagraph, cx: &mut RenderContext) -> AnyElement {
     cx.with_common_p(div())
         .children(render_markdown_text(parsed, cx))
-        .content_center()
         .flex()
-        .flex_row()
+        .flex_col()
         .into_any_element()
 }
 
 fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) -> Vec<AnyElement> {
-    let mut any_element = vec![];
+    let mut any_element = Vec::with_capacity(parsed_new.len());
     // these values are cloned in-order satisfy borrow checker
     let syntax_theme = cx.syntax_theme.clone();
     let workspace_clone = cx.workspace.clone();
     let code_span_bg_color = cx.code_span_background_color;
     let text_style = cx.text_style.clone();
+    let link_color = cx.link_color;
 
     for parsed_region in parsed_new {
         match parsed_region {
             MarkdownParagraphChunk::Text(parsed) => {
-                println!("rendering text: {}", parsed.contents);
-
                 let element_id = cx.next_id(&parsed.source_range);
 
                 let highlights = gpui::combine_highlights(
@@ -1029,6 +685,14 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
                                     range.clone(),
                                     HighlightStyle {
                                         background_color: Some(code_span_bg_color),
+                                        ..Default::default()
+                                    },
+                                ))
+                            } else if region.link.is_some() {
+                                Some((
+                                    range.clone(),
+                                    HighlightStyle {
+                                        color: Some(link_color),
                                         ..Default::default()
                                     },
                                 ))
@@ -1093,72 +757,12 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
                     .into_any();
                 any_element.push(element);
             }
+
             MarkdownParagraphChunk::Image(image) => {
-                println!("rendering image: {:?}", image.link);
-                let image_resource = match image.link.clone() {
-                    Link::Web { url } => Resource::Uri(url.into()),
-                    Link::Path { path, .. } => Resource::Path(Arc::from(path)),
-                };
-
-                let element_id = cx.next_id(&image.source_range);
-
-                let image_element = div()
-                    .id(element_id)
-                    .cursor_pointer()
-                    .child(
-                        img(ImageSource::Resource(image_resource))
-                            .max_w_full()
-                            .with_fallback({
-                                let alt_text = image.alt_text.clone();
-                                move || div().children(alt_text.clone()).into_any_element()
-                            }),
-                    )
-                    .tooltip({
-                        let link = image.link.clone();
-                        move |_, cx| {
-                            InteractiveMarkdownElementTooltip::new(
-                                Some(link.to_string()),
-                                "open image",
-                                cx,
-                            )
-                            .into()
-                        }
-                    })
-                    .on_click({
-                        let workspace = workspace_clone.clone();
-                        let link = image.link.clone();
-                        move |_, window, cx| {
-                            if window.modifiers().secondary() {
-                                match &link {
-                                    Link::Web { url } => cx.open_url(url),
-                                    Link::Path { path, .. } => {
-                                        if let Some(workspace) = &workspace {
-                                            _ = workspace.update(cx, |workspace, cx| {
-                                                workspace
-                                                    .open_abs_path(
-                                                        path.clone(),
-                                                        OpenOptions {
-                                                            visible: Some(OpenVisible::None),
-                                                            ..Default::default()
-                                                        },
-                                                        window,
-                                                        cx,
-                                                    )
-                                                    .detach();
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    })
-                    .into_any();
-                any_element.push(image_element);
+                any_element.push(render_markdown_image(image, cx));
             }
-            MarkdownParagraphChunk::Latex(parsed_latex_math) => {
-                print!("rendering latex");
-                let latex_element = render_markdown_latex(parsed_latex_math, cx);
-                any_element.push(latex_element);
+            MarkdownParagraphChunk::Latex(latex) => {
+                any_element.push(render_markdown_latex(latex, cx));
             }
         }
     }
@@ -1171,25 +775,93 @@ fn render_markdown_rule(cx: &mut RenderContext) -> AnyElement {
     div().py(cx.scaled_rems(0.5)).child(rule).into_any()
 }
 
+fn render_markdown_image(image: &Image, cx: &mut RenderContext) -> AnyElement {
+    let image_resource = match image.link.clone() {
+        Link::Web { url } => Resource::Uri(url.into()),
+        Link::Path { path, .. } => Resource::Path(Arc::from(path)),
+    };
+
+    let element_id = cx.next_id(&image.source_range);
+    let workspace = cx.workspace.clone();
+
+    div()
+        .id(element_id)
+        .cursor_pointer()
+        .child(
+            img(ImageSource::Resource(image_resource))
+                .max_w_full()
+                .with_fallback({
+                    let alt_text = image.alt_text.clone();
+                    move || div().children(alt_text.clone()).into_any_element()
+                })
+                .when_some(image.height, |this, height| this.h(height))
+                .when_some(image.width, |this, width| this.w(width)),
+        )
+        .tooltip({
+            let link = image.link.clone();
+            let alt_text = image.alt_text.clone();
+            move |_, cx| {
+                InteractiveMarkdownElementTooltip::new(
+                    Some(alt_text.clone().unwrap_or(link.to_string().into())),
+                    "open image",
+                    cx,
+                )
+                .into()
+            }
+        })
+        .on_click({
+            let link = image.link.clone();
+            move |_, window, cx| {
+                if window.modifiers().secondary() {
+                    match &link {
+                        Link::Web { url } => cx.open_url(url),
+                        Link::Path { path, .. } => {
+                            if let Some(workspace) = &workspace {
+                                _ = workspace.update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_abs_path(
+                                            path.clone(),
+                                            OpenOptions {
+                                                visible: Some(OpenVisible::None),
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .detach();
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .into_any()
+}
+
 struct InteractiveMarkdownElementTooltip {
     tooltip_text: Option<SharedString>,
-    action_text: String,
+    action_text: SharedString,
 }
 
 impl InteractiveMarkdownElementTooltip {
-    pub fn new(tooltip_text: Option<String>, action_text: &str, cx: &mut App) -> Entity<Self> {
+    pub fn new(
+        tooltip_text: Option<SharedString>,
+        action_text: impl Into<SharedString>,
+        cx: &mut App,
+    ) -> Entity<Self> {
         let tooltip_text = tooltip_text.map(|t| util::truncate_and_trailoff(&t, 50).into());
 
         cx.new(|_cx| Self {
             tooltip_text,
-            action_text: action_text.to_string(),
+            action_text: action_text.into(),
         })
     }
 }
 
 impl Render for InteractiveMarkdownElementTooltip {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        tooltip_container(window, cx, |el, _, _| {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        tooltip_container(cx, |el, _| {
             let secondary_modifier = Keystroke {
                 modifiers: Modifiers::secondary_key(),
                 ..Default::default()
@@ -1213,6 +885,310 @@ impl Render for InteractiveMarkdownElementTooltip {
         })
     }
 }
+
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::process::Command;
+use std::env;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::thread;
+lazy_static::lazy_static! {
+    static ref GENERATING_LATEX: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
+    static ref GENERATING: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
+}
+
+fn generate_mermaid_svg_async(mermaid_code: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    mermaid_code.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let tmp_dir = env::temp_dir();
+    let tmp_png = tmp_dir.join(format!("diagram_{}.png", hash));
+    let tmp_mmd = tmp_dir.join(format!("diagram_{}.mmd", hash));
+
+    println!("tmp dir: {:?}", tmp_dir);
+
+    if tmp_png.exists() {
+        return tmp_png;
+    }
+
+    if !tmp_mmd.exists() {
+        std::fs::write(&tmp_mmd, mermaid_code).expect("Failed to write Mermaid file");
+    }
+
+    let mut generating = GENERATING.lock().unwrap();
+    if !generating.contains(&hash) {
+        generating.insert(hash);
+        let png_clone = tmp_png.clone();
+        let mmd_clone = tmp_mmd.clone();
+        thread::spawn(move || {
+            if !png_clone.exists() {
+                let _ = Command::new(r"C:\nvm4w\nodejs\mmdc.cmd")
+                    .args(&[
+                        "-i",
+                        mmd_clone.to_str().unwrap(),
+                        "-o",
+                        png_clone.to_str().unwrap(),
+                        "-w",
+                        "600",
+                        "-H",
+                        "400",
+                    ])
+                    .status();
+            }
+            GENERATING.lock().unwrap().remove(&hash);
+        });
+    }
+
+    tmp_png
+}
+
+fn render_markdown_mermaid(mermaid: &ParsedMarkdownMermaid, cx: &mut RenderContext) -> AnyElement {
+    // let url = String::from("file:///C:/Users/Charbel/Downloads/Untitled%20diagram%20_%20Mermaid%20Chart-2025-08-19-011545.svg");
+    //                let image_resource = Resource::Uri(url.into());0
+
+    let svg_path = generate_mermaid_svg_async(&mermaid.contents);
+    println!("svg path: {:?}", svg_path);
+
+    //  let svg_path = "tmp\test.png";
+    let image_resource = Resource::Path(Arc::from(Path::new(&svg_path)));
+
+    let element_id = cx.next_id(&mermaid.source_range);
+
+    let image_element = div()
+        .id(element_id)
+        .cursor_pointer()
+        .child(img(ImageSource::Resource(image_resource)).max_w_full())
+        .into_any();
+
+    // let svg_path = "C:\\Users\\Charbel\\OneDrive\\Desktop\\zed\\tmp\\equation.svg";
+    // let test_svg = PathBuf::from(&svg_path);
+
+    // let image_svg = div()
+    //     .id(element_id)
+    //     .cursor_pointer()
+    //     .child( img(ImageSource::from(test_svg.clone()))
+    //     .max_w_full()
+    //     .max_h_full()
+    //     .with_fallback(|| {
+    //         div()
+    //             .p_4()
+    //             .child("Failed to load SVG file")
+    //             .into_any_element()
+    //     })
+    //     )
+    //     .into_any_element();
+    //     return image_svg;
+    // }
+    image_element
+}
+
+use mathjax::MathJax;
+use resvg::render;
+use resvg::tiny_skia::{Pixmap, Transform};
+use resvg::usvg::{Options, Tree, TreeParsing};
+
+fn generate_latex_mathjax_svg_async(latex_code: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    latex_code.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let tmp_dir = env::temp_dir();
+    let svg_file = tmp_dir.join(format!("latex_{}.svg", hash));
+
+    if svg_file.exists() {
+        return svg_file;
+    }
+
+    let mut generating = GENERATING_LATEX.lock().unwrap();
+    if !generating.contains(&hash) {
+        generating.insert(hash);
+        let code = latex_code.to_string();
+        let svg_clone = svg_file.clone();
+
+        thread::spawn(move || {
+            let renderer = MathJax::new().expect("Failed to initialize MathJax");
+            let mut result = renderer.render(&code).expect("Failed to render LaTeX");
+            result.set_color("white");
+
+            let write_path = svg_clone.clone();
+            std::fs::write(write_path, result.into_raw()).unwrap();
+
+            println!("SVG generated: {:?}", svg_clone);
+            GENERATING_LATEX.lock().unwrap().remove(&hash);
+        });
+    }
+
+    svg_file
+}
+
+fn generate_latex_mathjax_svg(latex_code: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    latex_code.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let tmp_dir = env::temp_dir();
+    let svg_file = tmp_dir.join(format!("latex_{}.svg", hash));
+
+    if svg_file.exists() {
+        return svg_file;
+    }
+
+    let renderer = MathJax::new().expect("Failed to initialize MathJax");
+    let mut result = renderer.render(latex_code).expect("Failed to render LaTeX");
+    result.set_color("white");
+
+    std::fs::write(&svg_file, result.into_raw()).unwrap();
+    svg_file
+}
+
+fn generate_latex_mathjax_png_async(latex_code: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    latex_code.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let tmp_dir = env::temp_dir();
+    let png_file = tmp_dir.join(format!("latex_{}.png", hash));
+
+    if png_file.exists() {
+        return png_file;
+    }
+
+    let mut generating = GENERATING_LATEX.lock().unwrap();
+    if !generating.contains(&hash) {
+        generating.insert(hash);
+        let code = latex_code.to_string();
+        let png_clone = png_file.clone();
+
+        thread::spawn(move || {
+            let renderer = MathJax::new().expect("Failed to initialize MathJax");
+
+            let mut result = renderer.render(&code).expect("Failed to render LaTeX");
+            result.set_color("white");
+            let image = result.into_image(1.4).expect("Failed to convert to image");
+
+            image.save(&png_clone).expect("Failed to save PNG file");
+
+            println!("PNG generated: {:?}", png_clone);
+            GENERATING_LATEX.lock().unwrap().remove(&hash);
+        });
+    }
+
+    png_file
+}
+
+fn generate_latex_png_async(latex_code: &str) -> PathBuf {
+    // Hash LaTeX code
+    let mut hasher = DefaultHasher::new();
+    latex_code.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let tmp_dir = env::temp_dir();
+    let png_file = tmp_dir.join(format!("latex_{}.png", hash));
+
+    if png_file.exists() {
+        return png_file;
+    }
+
+    let mut generating = GENERATING_LATEX.lock().unwrap();
+    if !generating.contains(&hash) {
+        generating.insert(hash);
+        let code = latex_code.to_string();
+        let png_clone = png_file.clone();
+
+        thread::spawn(move || {
+            // Step 1: Render LaTeX → SVG using KaTeX (Node.js)
+            let svg_content = {
+                let output = std::process::Command::new("node")
+                    .arg("-e")
+                    .arg(format!(
+                        r#"
+            const katex = require('katex');
+            const svg = katex.renderToString(`{}`, {{ throwOnError: false, output: 'svg' }});
+            console.log(svg);
+        "#,
+                        code.replace('`', "\\`")
+                    ))
+                    .output()
+                    .expect("Failed to run Node.js KaTeX");
+
+                let svg = String::from_utf8_lossy(&output.stdout).to_string();
+                println!("SVG OUTPUT: {}", svg); // << check this!
+                svg
+            };
+            println!("SVG Content: {}", svg_content);
+
+            // Step 2: Convert SVG → PNG using resvg + tiny-skia
+            let options = Options::default();
+            let tree = Tree::from_str(&svg_content, &options).expect("Failed to parse SVG");
+            let size = tree.size.to_screen_size();
+            let mut pixmap =
+                Pixmap::new(size.width(), size.height()).expect("Failed to create pixmap");
+
+            // Render with default transform
+            render(
+                &tree,
+                resvg::FitTo::Original,
+                Transform::default(),
+                pixmap.as_mut(),
+            )
+            .expect("Failed to render SVG to PNG");
+
+            // Write PNG to file
+            let mut file = File::create(&png_clone).expect("Failed to create PNG file");
+            let png_data = pixmap.encode_png().expect("Failed to encode PNG");
+            file.write_all(&png_data).expect("Failed to write PNG file");
+
+            println!("PNG generated: {:?}", png_clone);
+            GENERATING_LATEX.lock().unwrap().remove(&hash);
+        });
+    }
+
+    png_file
+}
+
+fn render_markdown_latex(latex: &ParsedLatexMath, cx: &mut RenderContext) -> AnyElement {
+    let svg_path = generate_latex_mathjax_png_async(&latex.contents);
+    let image_resource = Resource::Path(Arc::from(Path::new(&svg_path)));
+    let element_id = cx.next_id(&latex.source_range);
+
+    div()
+        .id(element_id)
+        .border_5()
+        .cursor_pointer()
+        .children(vec![
+            img(ImageSource::Resource(image_resource))
+                .max_w_full()
+                .with_loading(|| div().p_4().child("Loading 2").into_any_element()),
+        ])
+        .into_any()
+
+    // h_flex()
+    // .gap_10()
+    // .border_10()
+    // .id(element_id)
+    // .cursor_pointer()
+    // .children(vec![
+    //     img(ImageSource::Resource(image_resource))
+    //         .max_w_full()
+    //         .with_loading(|| {
+    //             div()
+    //                 .p_4()
+    //                 .child("Loading 2")
+    //                 .into_any_element()
+    //         }),
+    // ])
+    // .into_any()
+}
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -1354,4 +1330,6 @@ mod tests {
             ])
         );
     }
+
+    
 }

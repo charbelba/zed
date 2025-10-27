@@ -197,30 +197,38 @@ impl<'a> MarkdownParser<'a> {
                     Some(vec![ParsedMarkdownElement::BlockQuote(block_quote)])
                 }
                 Tag::CodeBlock(kind) => {
-                    let language = match kind {
-                        pulldown_cmark::CodeBlockKind::Indented => None,
-                        pulldown_cmark::CodeBlockKind::Fenced(language) => {
-                            if language.is_empty() {
-                                None
-                            } else {
-                                Some(language.to_string())
-                            }
-                        }
-                    };
-                
-                    self.cursor += 1;
-                
-                    if let Some(lang) = &language {
-                        if lang.eq_ignore_ascii_case("mermaid") {
-                            println!("Parsing mermaid block with source range: {:?}", source_range);
-                            let mermaid = self.parse_mermaid(source_range.clone()).await;
-                            return Some(vec![ParsedMarkdownElement::Mermaid(mermaid)]);
-                        }
-                    }
-                
-                    let code_block = self.parse_code_block(language).await;
-                    Some(vec![ParsedMarkdownElement::CodeBlock(code_block)])
-                }
+    // Determine the language of the code block
+    let language = match kind {
+        pulldown_cmark::CodeBlockKind::Indented => None,
+        pulldown_cmark::CodeBlockKind::Fenced(lang) => {
+            let lang = lang.trim();
+            if lang.is_empty() {
+                None
+            } else {
+                Some(lang.to_string())
+            }
+        }
+    };
+
+    self.cursor += 1;
+
+    // If this is a fenced mermaid block, parse as Mermaid
+    if let Some(lang) = &language {
+        if lang.eq_ignore_ascii_case("mermaid") {
+            println!("Parsing mermaid block with source range: {:?}", source_range);
+            let mermaid = self.parse_mermaid(source_range.clone()).await;
+            return Some(vec![ParsedMarkdownElement::Mermaid(mermaid)]);
+        }
+    }
+
+    // Otherwise, parse as a normal code block
+let code_block = self.parse_code_block(language)
+    .await
+    .expect("Failed to parse code block");
+
+Some(vec![ParsedMarkdownElement::CodeBlock(code_block)])
+}
+
                 Tag::HtmlBlock => {
                     self.cursor += 1;
 
@@ -409,7 +417,7 @@ impl<'a> MarkdownParser<'a> {
                     if !text.is_empty() {
         markdown_text_like.push(MarkdownParagraphChunk::Text(ParsedMarkdownText {
             source_range: source_range.clone(),
-            contents: text.clone(),
+            contents: text.clone().into(),
             highlights,
             region_ranges,
             regions,
