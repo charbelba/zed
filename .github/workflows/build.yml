@@ -65,12 +65,12 @@ jobs:
 
       - name: Prepare artifact
         run: |
-          mkdir -p artifacts
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/${{ matrix.target }}/release/*.exe artifacts/
-          else
-            cp target/${{ matrix.target }}/release/* artifacts/
-          fi
+           mkdir -p artifacts
+           if [ "${{ runner.os }}" = "Windows" ]; then
+           cp target/${{ matrix.target }}/release/*.exe artifacts/
+           else
+           find target/${{ matrix.target }}/release/ -maxdepth 1 -type f -exec cp {} artifacts/ \;
+           fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
